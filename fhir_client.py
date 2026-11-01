@@ -52,3 +52,10 @@ def update(resource: dict) -> dict:
     """PUT /Type/id: replace an existing resource whose ID we already know."""
     rt = resource["resourceType"]
     return _check(requests.put(f"{FHIR_BASE_URL}/{rt}/{resource['id']}", json=resource, headers=FHIR_HEADERS, timeout=TIMEOUT))
+
+
+def count(resource_type: str, params: dict) -> int:
+    """Number of resources matching a search, without downloading them (_summary=count)."""
+    headers = {**FHIR_HEADERS, "Cache-Control": "no-cache"}
+    bundle = _check(requests.get(f"{FHIR_BASE_URL}/{resource_type}", params={**params, "_summary": "count"}, headers=headers, timeout=TIMEOUT))
+    return bundle.get("total", 0)

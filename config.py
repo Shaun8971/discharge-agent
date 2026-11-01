@@ -36,3 +36,15 @@ SEED_TAG_CODE = "seed"
 SEED_ID_SYSTEM = "urn:demo:seed-id"
 
 LOG_PATH = "data/conversations.jsonl"
+
+# Statistics from this hospital: shown at the bottom of the dashboard.
+# Fill these in yourself with real figures (e.g. from the CMS Hospital Readmissions Reduction
+# Program data) and cite where they came from in `source`. While a value is left as
+# None or "REPLACE_ME", the dashboard shows "Not filled in yet" for it.
+HOSPITAL_STATS = {
+    "hospital_name": "WellSpan York Hospital",
+    "condition": "Heart failure",          # e.g. "Heart failure"
+    "annual_discharges": 334,          # discharges per year for that condition
+    "annual_readmissions": 56,        # readmissions per year for that condition
+    "source": "CMS Hospital Readmissions Reduction Program, Medicare patients, Jul 2021 to Jun 2024, averaged per year",             # e.g. dataset name, performance period, URL
+}

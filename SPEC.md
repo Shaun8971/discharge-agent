@@ -2,7 +2,7 @@
 
 ## What we're building
 
-A 1-day prototype (5 to 6 hours). An HL7 v2 ADT A03 (discharge) message triggers a Claude agent that chats by text with the discharged patient. The agent reads and writes a FHIR R4 server through three tools. A Streamlit dashboard shows KPIs and a simple ROI estimate.
+A 1-day prototype (5 to 6 hours). An HL7 v2 ADT A03 (discharge) message triggers a Claude agent that chats by text with the discharged patient. The agent reads and writes a FHIR R4 server through three tools. A Streamlit dashboard shows KPIs and a small section of hospital statistics.
 
 Flow: HL7 ADT A03 message -> parser -> FHIR patient lookup -> Claude agent chat -> tools write to FHIR -> dashboard
 
@@ -182,12 +182,14 @@ When I click "End conversation", make one extra Claude call that returns JSON on
 
 ## Phase 4: Streamlit app (about 1 hour)
 
-### Page 1: Discharges and chat
+### Page 1: Patient follow-up
 
-- List the files in `hl7_messages/` with a "Process discharge" button for each.
-- On click: parse, look up the patient, start the agent. Show the parsed HL7 fields in an expander.
+- A table of recently discharged patients, one row per `hl7_messages/*.hl7` file: MRN, patient name, discharge time (hospital local time), follow-up status (Not contacted / In progress / Completed) and one action button.
+- The button is "Start follow-up" (not contacted), "Resume chat" (in progress) or "View chat" (completed). It does not say "process discharge": the discharge already happened; the agent is following up after it.
+- On the first click: parse, look up the patient in FHIR, start the agent. Below the table, show a "Follow-up chat" panel with the parsed HL7 fields and matching FHIR IDs in an expander.
+- Each patient keeps their own saved conversation for the browser session. Switching to another patient and coming back resumes the same chat, exactly where it was left. A completed conversation reopens read-only with its outcome, and offers "Start a new follow-up with this patient". Chat transcripts are held in the Streamlit session only (they are not stored in FHIR or the log), so reloading the page clears them.
 - Chat UI with `st.chat_message` and `st.chat_input`. I type as the patient.
-- Sidebar "Behind the scenes" panel: live list of tool calls with inputs and results, so viewers can see FHIR reads and writes happening.
+- Sidebar "Behind the scenes" panel: live list of tool calls (for the selected patient) with inputs and results, so viewers can see FHIR reads and writes happening.
 - "End conversation" button runs the summary step and shows the outcome.
 
 ### Page 2: Dashboard
@@ -202,19 +204,18 @@ KPI tiles:
 - Average Claude response latency
 - Table of recent conversations: time, MRN, outcome fields, cost
 
-ROI panel (inputs in a form; everything except the CMS figures is labeled as an assumption):
+Statistics from this hospital (a small section at the bottom of the dashboard, replacing the earlier ROI panel; there is no ROI calculation):
 
-- Inputs:
-  - Hospital name and condition (e.g. heart failure)
-  - Discharges and readmissions for that condition, from the CMS Hospital Readmissions Reduction Program dataset (check the dataset's performance period and convert to annual)
-  - Cost per readmission (assumption)
-  - Expected relative reduction in readmissions from follow-up (assumption, default 10%)
-  - Agent cost per conversation (default = measured average from the log)
-- Outputs:
-  - Baseline readmissions per year and readmissions avoided per year
-  - Gross savings per year, agent cost per year, net savings
-  - Break-even reduction % (the reduction needed for savings to equal agent cost)
-- Note under the panel: "Directional estimate. HRRP penalty effects not modeled."
+- Titled "Statistics from this hospital".
+- Values come from a `HOSPITAL_STATS` block in `config.py`: hospital name, condition, annual discharges, annual readmissions, and source. The user fills in real figures themselves (for example from the CMS Hospital Readmissions Reduction Program data) and cites the source.
+- While a value is still a placeholder (`None` or `"REPLACE_ME"`), show "Not filled in yet" for that field instead of a number.
+
+Implementation notes:
+
+- `app.py` uses `st.navigation` with two pages defined as functions. Each dashboard tile is labeled (log) or (FHIR) to show where its number comes from.
+- Counts from FHIR use `_summary=count` (`fhir_client.count`) with the agent tag; routine/urgent come from `Task?priority=`.
+- Cost per conversation = (input + 1.25 x cache-write + 0.10 x cache-read tokens) x input price + output tokens x output price, all per million tokens (`logger.conversation_cost`).
+- Latency is the mean over every Claude call in the log.
 
 ## Phase 5: README and demo (about 1 hour)
 
@@ -248,5 +249,5 @@ Demo script (5 conversations I will run):
 - [ ] Agent books appointments and creates Tasks that are visible in FHIR via curl
 - [ ] Agent gives no medical advice in demo conversations 4 and 5
 - [ ] Dashboard KPIs match what is in FHIR
-- [ ] ROI panel works with one real hospital's CMS numbers
+- [ ] "Statistics from this hospital" section shows real figures and a source once the user fills in `HOSPITAL_STATS`
 - [ ] README complete and 2-minute demo recorded
