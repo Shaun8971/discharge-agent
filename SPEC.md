@@ -52,6 +52,9 @@ discharge-agent/
 - Patient identifier: system `urn:demo:mrn`, values `MRN1001` to `MRN1005`.
 - Every resource the agent creates gets a `meta.tag` with system `urn:demo:source` and code `discharge-agent`. The dashboard uses this tag to count agent activity.
 - All FHIR requests use `Content-Type: application/fhir+json`.
+- Code systems: drugs use RxNorm (`http://www.nlm.nih.gov/research/umls/rxnorm`); diagnoses use ICD-10-CM (`http://hl7.org/fhir/sid/icd-10-cm`).
+- Seeded Encounter, Condition, MedicationRequest and Appointment resources carry an identifier in system `urn:demo:seed-id` (e.g. `MRN1001-ENC`) so the seed script can find them on re-run.
+- Searches send `Cache-Control: no-cache` (HAPI caches identical searches for about a minute).
 
 ---
 
@@ -61,33 +64,39 @@ discharge-agent/
 
 - **Patient**: identifier (MRN), name, birthDate, phone (555 numbers), address in a made-up town.
 - **Encounter**: status `finished`, class `IMP` (inpatient), period start and end (end = discharge time, within the last 2 days), subject reference to the Patient.
-- **MedicationRequest** (2 or 3 each): status `active`, intent `order`, `medicationCodeableConcept.text` (plain name and strength, e.g. "Metoprolol 25 mg tablet"), `dosageInstruction[0].text` (e.g. "Take 1 tablet by mouth twice daily").
+- **MedicationRequest** (2 or 3 each): status `active`, intent `order`, `medicationCodeableConcept` with both `text` (plain name and strength, e.g. "Metoprolol 25 mg tablet") and one RxNorm `coding` (system, code, display) for the exact drug, strength and form (RxNorm "clinical drug" level, TTY `SCD`; codes verified against NLM RxNav), plus `dosageInstruction[0].text` (e.g. "Take 1 tablet by mouth twice daily").
+- **Condition** (1 each): the discharge diagnosis, coded in ICD-10-CM (conditions from the CMS readmission program: heart failure, AMI, pneumonia, COPD). `subject` = Patient, `encounter` = the Encounter, category `encounter-diagnosis`, clinicalStatus `active`. The Encounter links back to it via `Encounter.diagnosis` with `use` = `DD` (discharge diagnosis, system `http://terminology.hl7.org/CodeSystem/diagnosis-role`) and `rank` 1.
 - **Appointment**: only for MRN1002 and MRN1004 (they already have a follow-up booked). The others have none, so the agent can book one.
 
 Requirements:
 
-- Idempotent: running the script twice must not create duplicates. Use conditional update on identifier for Patient (`PUT /Patient?identifier=urn:demo:mrn|MRN1001`), and search-before-create for the other resources.
-- Print a short table at the end: MRN, FHIR Patient ID, number of meds, has appointment.
+- Idempotent: running the script twice must not create duplicates. Use conditional update on identifier for Patient (`PUT /Patient?identifier=urn:demo:mrn|MRN1001`), and search-before-create for the other resources. If a resource already exists but differs from the seed definition (e.g. it predates the codes), update it in place; relative times (discharge time, appointment time) are kept from the first run.
+- The agent never sees RxNorm or ICD-10 codes (see `get_patient_context` in Phase 3). The codes exist so the FHIR data is realistic and the ADT message can be cross-checked against it.
+- Print a short table at the end: MRN, FHIR Patient ID, number of meds, has appointment, discharge diagnosis code.
 
 Test:
 
 - `curl "http://localhost:8080/fhir/Patient?identifier=urn:demo:mrn|MRN1001"`
-- `curl "http://localhost:8080/fhir/MedicationRequest?subject=Patient/<id>"`
+- `curl "http://localhost:8080/fhir/MedicationRequest?subject=Patient/<id>"` (each has an RxNorm coding)
+- `curl "http://localhost:8080/fhir/Condition?subject=Patient/<id>"` (one ICD-10-CM code)
+- `curl "http://localhost:8080/fhir/Encounter?subject=Patient/<id>"` (`diagnosis[0].use` = DD)
+- Resource counts after running the seed twice: 5 Patient, 5 Encounter, 5 Condition, 12 MedicationRequest, 2 Appointment.
 
 ## Phase 2: HL7 ADT A03 messages and parser (about 45 min)
 
-Create 5 files in `hl7_messages/`, one per patient (`adt_a03_MRN1001.hl7`, etc.). HL7 v2.5 with segments MSH, EVN, PID, PV1:
+Create 5 files in `hl7_messages/`, one per patient (`adt_a03_MRN1001.hl7`, etc.). HL7 v2.5 with segments MSH, EVN, PID, PV1, DG1:
 
 - MSH-9 = `ADT^A03`, MSH-10 = unique message control ID
 - PID-3 = MRN (must match the FHIR identifier), PID-5 = name, PID-7 = birth date
 - PV1-2 = `I` (inpatient), PV1-45 = discharge date/time
+- DG1 (diagnosis segment): DG1-1 = 1, DG1-2 = `I10` (ICD-10 coding method), DG1-3 = ICD-10-CM code (same as the seeded Condition for that patient, e.g. `I50.9^Heart failure, unspecified^I10`), DG1-6 = `F` (final diagnosis)
 
 `hl7_parser.py`:
 
-- `parse_adt(text) -> dict` returning `message_control_id`, `event_type`, `mrn`, `patient_name`, `discharge_time`.
+- `parse_adt(text) -> dict` returning `message_control_id`, `event_type`, `mrn`, `patient_name`, `discharge_time`, `diagnosis_code`.
 - Normalize line endings to `\r` before parsing (the `hl7` library expects `\r` segment separators).
 - Reject anything that is not ADT A03 with a clear error.
-- `find_patient(mrn) -> (patient_id, encounter_id)` using FHIR search by identifier, then the most recent finished Encounter.
+- `find_patient(mrn) -> (patient_id, encounter_id)` using FHIR search by identifier, then the most recent finished Encounter. A check (CLI and tests) confirms the DG1 code matches the code on the patient's FHIR Condition.
 - CLI: `python hl7_parser.py hl7_messages/adt_a03_MRN1001.hl7` prints the parsed fields and matching FHIR IDs.
 
 Add a short comment block at the top of the file explaining each segment and field used, in plain language.
@@ -101,6 +110,7 @@ Three tools. Each one validates its input, calls FHIR, returns a small JSON resu
 1. `get_patient_context(patient_id)`
    - Returns ONLY: first name, discharge date, list of meds (name + instruction text), upcoming appointments (date + status).
    - No address, phone, birth date, or full resources. This is the PHI minimization point.
+   - Also excludes diagnosis (ICD-10) and drug (RxNorm) codes: the model gets plain-language medication names and instructions only. The agent's job is logistics, so it has no need for the diagnosis.
 2. `book_followup(patient_id, date, time_of_day)`
    - `date`: ISO date, 1 to 14 days from today. `time_of_day`: `morning` or `afternoon` (map to 09:00 or 14:00, 30 min slot).
    - Creates Appointment: status `booked`, description "Post-discharge follow-up", start/end, participant actor = Patient (status `accepted`), agent tag.
