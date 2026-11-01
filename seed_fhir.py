@@ -12,9 +12,10 @@ HL7 message and FHIR agree exactly.
 """
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import fhir_client as fhir
-from config import MRN_SYSTEM, SEED_ID_SYSTEM, SEED_TAG_CODE, SOURCE_TAG_SYSTEM
+from config import HOSPITAL_TZ, MRN_SYSTEM, SEED_ID_SYSTEM, SEED_TAG_CODE, SOURCE_TAG_SYSTEM
 
 RXNORM = "http://www.nlm.nih.gov/research/umls/rxnorm"
 ICD10CM = "http://hl7.org/fhir/sid/icd-10-cm"
@@ -171,8 +172,9 @@ def seed_patient(mrn, first, last, dob, phone, street, hours_ago, has_appt, icd,
 
     # Appointment: a booked visit; participant.actor points at the Patient.
     if has_appt:
-        start = (now + timedelta(days=5)).replace(hour=10, minute=0, second=0, microsecond=0)
-        find_or_create(
+        # 10:00 in the hospital's timezone, 5 days out
+        start = (now.astimezone(ZoneInfo(HOSPITAL_TZ)) + timedelta(days=5)).replace(hour=10, minute=0, second=0, microsecond=0)
+        appt = find_or_create(
             {
                 "resourceType": "Appointment", "meta": TAG, "status": "booked",
                 "description": "Post-discharge follow-up",
@@ -181,6 +183,9 @@ def seed_patient(mrn, first, last, dob, phone, street, hours_ago, has_appt, icd,
             },
             f"{mrn}-APPT", keep=("start", "end"),
         )
+        # Seeds from before the timezone fix stored 10:00 UTC; correct those once.
+        if datetime.fromisoformat(appt["start"].replace("Z", "+00:00")).astimezone(ZoneInfo(HOSPITAL_TZ)).hour != 10:
+            fhir.update({**appt, "start": iso(start), "end": iso(start + timedelta(minutes=30))})
     return pid
 
 

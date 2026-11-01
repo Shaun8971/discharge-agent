@@ -23,7 +23,8 @@ All data is synthetic. No real patient data anywhere.
   - Base URL: `http://localhost:8080/fhir`
   - Fallback if Docker is unavailable: public test server `https://hapi.fhir.org/baseR4` (slower, shared, data may be reset)
 - Python packages: `anthropic`, `requests`, `hl7`, `streamlit`, `pandas`, `python-dotenv`
-- Claude model: read from env var `CLAUDE_MODEL`, default `claude-sonnet-5-5`
+- Claude access: through an Open WebUI gateway that speaks the Anthropic API. `.env` holds `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` and `CLAUDE_MODEL`. `CLAUDE_MODEL` must be the name the gateway lists (run `list_gateway_models.py`), which may differ from Anthropic's own model IDs. `test_gateway.py` checks the gateway supports tool use.
+- The Claude client is created in one place, `claude_client.py` (`get_client()`); every file imports it.
 - Secrets: `ANTHROPIC_API_KEY` in `.env` (never committed; provide `.env.example`)
 - Token prices: constants in `config.py`, filled in from Anthropic's pricing page
 
@@ -36,7 +37,10 @@ discharge-agent/
 ├── requirements.txt
 ├── README.md
 ├── config.py            # base URL, model, price constants, tag constants
-├── fhir_client.py       # thin wrapper: get, search, create, conditional update
+├── claude_client.py     # the one shared Anthropic client (gateway URL, key, timeout)
+├── test_gateway.py      # checks the gateway supports tool use
+├── list_gateway_models.py  # lists model names the gateway accepts
+├── fhir_client.py       # thin wrapper: get, search, create, update, conditional update
 ├── seed_fhir.py         # loads 5 synthetic patients
 ├── hl7_messages/        # 5 sample ADT A03 files
 ├── hl7_parser.py        # parse ADT A03, look up patient in FHIR
@@ -54,7 +58,8 @@ discharge-agent/
 - All FHIR requests use `Content-Type: application/fhir+json`.
 - Code systems: drugs use RxNorm (`http://www.nlm.nih.gov/research/umls/rxnorm`); diagnoses use ICD-10-CM (`http://hl7.org/fhir/sid/icd-10-cm`).
 - Seeded Encounter, Condition, MedicationRequest and Appointment resources carry an identifier in system `urn:demo:seed-id` (e.g. `MRN1001-ENC`) so the seed script can find them on re-run.
-- Searches send `Cache-Control: no-cache` (HAPI caches identical searches for about a minute).
+- Searches send `Cache-Control: no-cache` (HAPI caches identical searches, including `_summary=count`, for about a minute). Manual `curl` checks should add `-H "Cache-Control: no-cache"` or they can show stale results.
+- Timezone: appointment times are in the hospital's local timezone (`HOSPITAL_TZ` in `config.py`, America/New_York). Seeded appointments are at 10:00 local; the agent books 09:00 (morning) or 14:00 (afternoon) local.
 
 ---
 
@@ -106,10 +111,10 @@ Add a short comment block at the top of the file explaining each segment and fie
 
 ### tools.py
 
-Three tools. Each one validates its input, calls FHIR, returns a small JSON result, and records `{tool, input, ok, error, ms}` for the log. The agent never touches FHIR directly; it only calls these tools.
+Three tools. Each one validates its input, calls FHIR, returns a small JSON result, and records `{tool, input, ok, error, ms}` for the log. The agent never touches FHIR directly; it only calls these tools. `run_tool()` never raises: failures come back to the model as an error `tool_result`. It also rejects any `patient_id` other than the one this conversation is about, so the model cannot read or write another patient's records.
 
 1. `get_patient_context(patient_id)`
-   - Returns ONLY: first name, discharge date, list of meds (name + instruction text), upcoming appointments (date + status).
+   - Returns ONLY: first name, discharge date, list of meds (name + instruction text), upcoming appointments (date, local time, status).
    - No address, phone, birth date, or full resources. This is the PHI minimization point.
    - Also excludes diagnosis (ICD-10) and drug (RxNorm) codes: the model gets plain-language medication names and instructions only. The agent's job is logistics, so it has no need for the diagnosis.
 2. `book_followup(patient_id, date, time_of_day)`
@@ -122,9 +127,10 @@ Three tools. Each one validates its input, calls FHIR, returns a small JSON resu
 
 ### agent.py
 
-- Uses the Anthropic Python SDK with tool use. Loop: send messages + tools, run any `tool_use` blocks, return `tool_result` blocks, repeat until the model stops calling tools.
+- Uses the Anthropic Python SDK (via `claude_client.get_client()`) with tool use. Loop: send messages + tools, run any `tool_use` blocks, return `tool_result` blocks, repeat until the model stops calling tools.
 - Start of conversation: the first user-role message is a system event, not shown in the UI: `[DISCHARGE EVENT] patient_id=<id>, discharged=<time>. Begin the follow-up check-in.` The agent should call `get_patient_context` first, then greet the patient.
-- Track per conversation: turns, input/output tokens (from `response.usage`), latency per Claude call, tool calls.
+- Track per conversation: turns, tokens (from `response.usage`), latency per Claude call, tool calls. The gateway caches prompts automatically, so usage has three input counts: `input_tokens` (uncached), `cache_creation_input_tokens` and `cache_read_input_tokens`. Track all three plus output; cost (Phase 4) must price each (`CACHE_WRITE_MULTIPLIER` / `CACHE_READ_MULTIPLIER` in `config.py`).
+- Command-line chat for testing (before the Streamlit UI): `python agent.py hl7_messages/<file>.hl7` parses the message, looks up the patient, starts the agent, lets you type as the patient, prints every tool call and result as it happens, and runs the end-of-conversation step when you type `end`.
 
 System prompt (starting version, can be refined):
 
@@ -148,10 +154,18 @@ Rules:
 - If the patient describes something that sounds like an emergency, tell them
   to call 911 now, and call escalate_to_nurse with urgency "urgent".
 - If the patient is confused or you are unsure, escalate with urgency "routine".
+- Use urgency "routine" for medication questions, side effects, mild symptoms,
+  confusion, and anything else a nurse can handle during the day. Use "urgent"
+  only for an emergency (the 911 case).
+- When you escalate, say only that a nurse will follow up. Do not tell the
+  patient to take, avoid, stop, wait on, or change any medication or activity
+  (the only exception is telling them to call 911 in an emergency).
 - Keep messages short and friendly. Ask one question at a time.
 - Use only information from get_patient_context. Never invent appointment
   times or medications.
 ```
+
+The code also appends two practical notes to the prompt: today's date, and "pass the patient_id from the discharge event to every tool call" (plus the 9:00 / 14:00 slots).
 
 ### End of conversation
 
@@ -162,8 +176,9 @@ When I click "End conversation", make one extra Claude call that returns JSON on
 ```
 
 - `completed` = both checklist items (meds, follow-up) were covered.
+- The code overrides two model fields with ground truth from the tool log: `escalated` (true if `escalate_to_nurse` succeeded) and `followup` = `booked` (if `book_followup` succeeded). The first name is scrubbed from the summary.
 - Write a Communication resource: status `completed`, subject = Patient, sent = now, `payload[0].contentString` = summary, agent tag.
-- Append the full log record to `data/conversations.jsonl` (no patient names).
+- Append the full log record to `data/conversations.jsonl` (no patient names, and no transcript): timestamps, message control ID, MRN, FHIR IDs, model, turns, token counts (input, cache write, cache read, output), per-call latencies, tool call records, and the outcome JSON.
 
 ## Phase 4: Streamlit app (about 1 hour)
 
