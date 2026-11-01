@@ -4,8 +4,14 @@ Safe to run repeatedly: Patients use conditional update on the MRN identifier; t
 resources carry a seed identifier and are searched for before being created (and
 brought up to date if they already exist, e.g. to add codes).
 All data is synthetic.
+
+This script is the single source of discharge times: each Encounter's period.end is set
+relative to "now" on the first run (and kept on re-runs), and the matching ADT^A03 file in
+hl7_messages/ is written from the Encounter's stored end time, with a UTC offset, so the
+HL7 message and FHIR agree exactly.
 """
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import fhir_client as fhir
 from config import MRN_SYSTEM, SEED_ID_SYSTEM, SEED_TAG_CODE, SOURCE_TAG_SYSTEM
@@ -50,6 +56,30 @@ def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+HL7_DIR = Path(__file__).parent / "hl7_messages"
+
+
+def hl7_ts(dt: datetime) -> str:
+    """HL7 timestamp with timezone offset: YYYYMMDDHHMMSS+ZZZZ (always UTC here)."""
+    return dt.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S+0000")
+
+
+def write_hl7(mrn, first, last, dob, icd, icd_text, discharge: datetime) -> None:
+    """Write the ADT^A03 (discharge) message for this patient. Field meanings: see hl7_parser.py."""
+    ts = hl7_ts(discharge)
+    pv1 = [""] * 46
+    pv1[0], pv1[1], pv1[2], pv1[3], pv1[45] = "PV1", "1", "I", "3WEST^301^A", ts  # PV1-45 = discharge time
+    segments = [
+        f"MSH|^~\\&|DEMO_EHR|DEMO_GENERAL|DISCHARGE_AGENT|DEMO_GENERAL|{ts}||ADT^A03^ADT_A03|CTRL-{mrn}-001|P|2.5",
+        f"EVN|A03|{ts}",
+        f"PID|1||{mrn}^^^DEMO^MR||{last}^{first}||{dob.replace('-', '')}",
+        "|".join(pv1),
+        f"DG1|1|I10|{icd}^{icd_text}^I10||{ts}|F",
+    ]
+    HL7_DIR.mkdir(exist_ok=True)
+    (HL7_DIR / f"adt_a03_{mrn}.hl7").write_text("\r\n".join(segments) + "\r\n", newline="")
+
+
 def find_or_create(resource: dict, seed_id: str, keep: tuple = ()) -> dict:
     """Search-before-create using our seed identifier, so reruns add nothing.
 
@@ -86,6 +116,7 @@ def seed_patient(mrn, first, last, dob, phone, street, hours_ago, has_appt, icd,
     now = datetime.now(timezone.utc)
 
     # Encounter: one hospital stay. class IMP = inpatient. period.end = discharge time.
+    # On re-runs the stored period is kept, so this "now"-relative time only matters the first time.
     discharge = now - timedelta(hours=hours_ago)
     encounter = {
         "resourceType": "Encounter", "meta": TAG, "status": "finished",
@@ -94,6 +125,10 @@ def seed_patient(mrn, first, last, dob, phone, street, hours_ago, has_appt, icd,
         "period": {"start": iso(discharge - timedelta(days=4)), "end": iso(discharge)},
     }
     enc = find_or_create(dict(encounter), f"{mrn}-ENC", keep=("period",))
+
+    # Write the HL7 file from the time FHIR actually holds (not the freshly computed one).
+    stored_end = datetime.fromisoformat(enc["period"]["end"].replace("Z", "+00:00"))
+    write_hl7(mrn, first, last, dob, icd, icd_text, stored_end)
 
     # Condition: a diagnosis. Coded with ICD-10-CM, linked to the Patient and this Encounter.
     cond = find_or_create(

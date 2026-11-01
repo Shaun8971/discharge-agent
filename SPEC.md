@@ -72,6 +72,7 @@ Requirements:
 
 - Idempotent: running the script twice must not create duplicates. Use conditional update on identifier for Patient (`PUT /Patient?identifier=urn:demo:mrn|MRN1001`), and search-before-create for the other resources. If a resource already exists but differs from the seed definition (e.g. it predates the codes), update it in place; relative times (discharge time, appointment time) are kept from the first run.
 - The agent never sees RxNorm or ICD-10 codes (see `get_patient_context` in Phase 3). The codes exist so the FHIR data is realistic and the ADT message can be cross-checked against it.
+- `seed_fhir.py` is the single source of discharge times. On the first run each Encounter's `period.end` is set relative to now and stored in FHIR; on re-runs the stored time is kept. The script then (re)writes `hl7_messages/adt_a03_<MRN>.hl7` from the Encounter's stored end time, so the HL7 message and FHIR always agree. The files are generated output, but are committed so the repo works without seeding first (re-seeding overwrites them).
 - Print a short table at the end: MRN, FHIR Patient ID, number of meds, has appointment, discharge diagnosis code.
 
 Test:
@@ -84,19 +85,19 @@ Test:
 
 ## Phase 2: HL7 ADT A03 messages and parser (about 45 min)
 
-Create 5 files in `hl7_messages/`, one per patient (`adt_a03_MRN1001.hl7`, etc.). HL7 v2.5 with segments MSH, EVN, PID, PV1, DG1:
+`seed_fhir.py` generates 5 files in `hl7_messages/`, one per patient (`adt_a03_MRN1001.hl7`, etc.), with discharge times taken from FHIR (see Phase 1). Also create one invalid message, `hl7_messages/invalid/adt_a01_MRN1001.hl7` (an ADT^A01 admit instead of an A03 discharge), to confirm the parser rejects it. It is hand-written, is not touched by the seed script, and is left as is. It lives in a subfolder so the Phase 4 file list (which reads only `hl7_messages/*.hl7`) does not show it. HL7 v2.5 with segments MSH, EVN, PID, PV1, DG1:
 
 - MSH-9 = `ADT^A03`, MSH-10 = unique message control ID
 - PID-3 = MRN (must match the FHIR identifier), PID-5 = name, PID-7 = birth date
-- PV1-2 = `I` (inpatient), PV1-45 = discharge date/time
+- PV1-2 = `I` (inpatient), PV1-45 = discharge date/time with UTC offset, format `YYYYMMDDHHMMSS+ZZZZ` (e.g. `20261031201500+0000`); the same time as `Encounter.period.end` for that patient. MSH-7, EVN-2 and DG1-5 carry the same timestamp.
 - DG1 (diagnosis segment): DG1-1 = 1, DG1-2 = `I10` (ICD-10 coding method), DG1-3 = ICD-10-CM code (same as the seeded Condition for that patient, e.g. `I50.9^Heart failure, unspecified^I10`), DG1-6 = `F` (final diagnosis)
 
 `hl7_parser.py`:
 
 - `parse_adt(text) -> dict` returning `message_control_id`, `event_type`, `mrn`, `patient_name`, `discharge_time`, `diagnosis_code`.
 - Normalize line endings to `\r` before parsing (the `hl7` library expects `\r` segment separators).
-- Reject anything that is not ADT A03 with a clear error.
-- `find_patient(mrn) -> (patient_id, encounter_id)` using FHIR search by identifier, then the most recent finished Encounter. A check (CLI and tests) confirms the DG1 code matches the code on the patient's FHIR Condition.
+- Reject anything that is not ADT A03 with a clear error. Also raise a clear error for a missing MSH, missing required fields, unknown MRN, or a patient with no finished Encounter (one `HL7Error` class).
+- `find_patient(mrn) -> (patient_id, encounter_id)` using FHIR search by identifier, then the most recent finished Encounter. Two checks (CLI and tests), each reported the same way ("matches" / "DOES NOT MATCH", non-zero exit on failure): the DG1 code matches the code on the patient's FHIR Condition, and the PV1-45 discharge time matches the FHIR Encounter `period.end` within 5 minutes. HL7 timestamps may include a UTC offset; a timestamp without one is treated as UTC for the comparison. `discharge_time` is returned as ISO 8601 (with offset when present).
 - CLI: `python hl7_parser.py hl7_messages/adt_a03_MRN1001.hl7` prints the parsed fields and matching FHIR IDs.
 
 Add a short comment block at the top of the file explaining each segment and field used, in plain language.
