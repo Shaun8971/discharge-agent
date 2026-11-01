@@ -65,6 +65,19 @@ SUMMARY_PROMPT = """You review a finished post-discharge check-in chat and reply
 
 
 class Conversation:
+    """One post-discharge check-in between the agent and one patient.
+
+    Holds the message history sent to Claude, token and latency counters, and the tool-call
+    record. Typical use: Conversation(...).start(), then .send(text) for each patient message,
+    then .end() to summarize, write to FHIR and log.
+
+    Args:
+        parsed (dict): output of hl7_parser.parse_adt.
+        patient_id (str): FHIR Patient ID.
+        encounter_id (str): FHIR Encounter ID.
+        on_tool_call (callable | None): called as on_tool_call(record, result) after each tool
+            runs, so a UI can show it.
+    """
     def __init__(self, parsed: dict, patient_id: str, encounter_id: str, on_tool_call=None):
         self.parsed, self.patient_id, self.encounter_id = parsed, patient_id, encounter_id
         self.on_tool_call = on_tool_call or (lambda record, result: None)
@@ -82,6 +95,17 @@ class Conversation:
 
     # --- Claude calls ---
     def _call_claude(self, **kwargs):
+        """Make one Claude request and update the counters (latency, tokens, cache tokens).
+
+        Args:
+            **kwargs: passed to client.messages.create (system, tools, messages).
+
+        Returns:
+            anthropic.types.Message: the model response.
+
+        Raises:
+            anthropic.APIError: if the gateway or model call fails.
+        """
         t0 = time.perf_counter()
         response = self.client.messages.create(model=CLAUDE_MODEL, max_tokens=600, **kwargs)
         self.latencies_ms.append(round((time.perf_counter() - t0) * 1000))
@@ -92,7 +116,15 @@ class Conversation:
         return response
 
     def _run_loop(self) -> str:
-        """Call Claude; run any tools it asks for; repeat until it replies with plain text."""
+        """The agentic loop: call Claude, run any tools it asks for, send the results back, and repeat
+        until it answers in plain text (at most MAX_TOOL_ROUNDS times).
+
+        Returns:
+            str: the assistant's text reply, or a fixed apology if the round limit is hit.
+
+        Raises:
+            anthropic.APIError: if a Claude call fails.
+        """
         for _ in range(MAX_TOOL_ROUNDS):
             response = self._call_claude(system=self.system, tools=tools.TOOL_SPECS, messages=self.messages)
             blocks = [
@@ -116,7 +148,16 @@ class Conversation:
 
     # --- conversation ---
     def start(self) -> str:
-        """First message is a system event, not shown to the patient."""
+        """Begin the conversation. The first user-role message is a system event that is not shown to the
+        patient: "[DISCHARGE EVENT] patient_id=..., discharged=.... Begin the follow-up check-in."
+
+        Returns:
+            str: the agent's greeting (it normally calls get_patient_context first).
+
+        Example:
+            >>> convo.start()
+            'Hi Alice, this is Demo General Hospital checking in after your discharge. ...'
+        """
         self.messages.append({
             "role": "user",
             "content": f"[DISCHARGE EVENT] patient_id={self.patient_id}, discharged={self.parsed['discharge_time']}. Begin the follow-up check-in.",
@@ -124,12 +165,29 @@ class Conversation:
         return self._run_loop()
 
     def send(self, text: str) -> str:
+        """Send one patient message and return the agent's reply.
+
+        Args:
+            text (str): what the patient typed.
+
+        Returns:
+            str: the agent's reply.
+
+        Example:
+            >>> convo.send("yes I have them all")
+            'Great, thanks for confirming. I do not see a follow-up appointment ...'
+        """
         self.turns += 1
         self.messages.append({"role": "user", "content": text})
         return self._run_loop()
 
     def _transcript(self) -> str:
-        """Plain-text version of the chat (no tool blocks) for the summary call."""
+        """Build a plain-text transcript (PATIENT / ASSISTANT lines plus short tool notes, patient_id
+        removed) for the summary call.
+
+        Returns:
+            str: the transcript, without the hidden discharge event.
+        """
         lines = []
         for m in self.messages[1:]:  # skip the discharge event
             if isinstance(m["content"], str):
@@ -145,7 +203,20 @@ class Conversation:
         return "\n".join(lines)
 
     def end(self) -> dict:
-        """Extra Claude call -> JSON outcome; write a FHIR Communication; append the log record."""
+        """Finish the conversation: ask Claude for the JSON outcome, correct two fields from the tool log,
+        scrub the first name, write a FHIR Communication, and append the log record.
+
+        Returns:
+            dict: {"completed", "meds_confirmed", "followup", "escalated", "summary"}.
+
+        Raises:
+            anthropic.APIError: if the summary call fails.
+            fhir_client.FhirError: if the Communication cannot be written.
+
+        Example:
+            >>> convo.end()["followup"]
+            'booked'
+        """
         response = self._call_claude(
             system=SUMMARY_PROMPT,
             messages=[{"role": "user", "content": "Chat transcript:\n" + self._transcript()}],
@@ -176,7 +247,20 @@ class Conversation:
 
 
 def _parse_outcome(raw: str) -> dict:
-    """Parse and validate the summary JSON; fall back to safe values if the model misbehaves."""
+    """Parse and validate the summary JSON from the model, falling back to safe values.
+
+    Args:
+        raw (str): the model's reply text (may include code fences or extra words).
+
+    Returns:
+        dict: completed (bool), meds_confirmed (yes/no/unclear), followup
+            (booked/already_scheduled/declined/not_discussed), escalated (bool), summary (str).
+            If no JSON object is found: completed False, "unclear", "not_discussed", and a notice.
+
+    Example:
+        >>> _parse_outcome("I cannot do that")["summary"]
+        'Summary unavailable: the model did not return valid JSON.'
+    """
     safe = {"completed": False, "meds_confirmed": "unclear", "followup": "not_discussed", "escalated": False,
             "summary": "Summary unavailable: the model did not return valid JSON."}
     m = re.search(r"\{.*\}", raw, re.S)
@@ -195,12 +279,32 @@ def _parse_outcome(raw: str) -> dict:
 
 
 def print_tool_call(record: dict, result: dict) -> None:
+    """Print one tool call and its result to the terminal (used by the command-line chat).
+
+    Args:
+        record (dict): {"tool", "input", "ok", "error", "ms"}.
+        result (dict): what the tool returned.
+
+    Example output:
+          [TOOL] book_followup {"patient_id": "1000", "date": "2026-11-02", "time_of_day": "afternoon"}
+          [RESULT] ok (176 ms) {"appointment_id": "1032", ...}
+    """
     status = "ok" if record["ok"] else f"ERROR: {record['error']}"
     print(f"\n  [TOOL] {record['tool']} {json.dumps(record['input'])}")
     print(f"  [RESULT] {status} ({record['ms']} ms) {json.dumps(result)}")
 
 
 def main(path: str) -> int:
+    """Command-line chat: parse the file, find the patient, start the agent, let you type replies as
+    the patient, and run the summary when you type "end".
+
+    Args:
+        path (str): path to an .hl7 file.
+
+    Returns:
+        int: 0 on a normal exit, 1 if the file cannot be parsed or the patient is not found.
+            Ctrl+C or Ctrl+D exits without a summary and logs nothing.
+    """
     try:
         with open(path, newline="") as f:
             parsed = hl7_parser.parse_adt(f.read())

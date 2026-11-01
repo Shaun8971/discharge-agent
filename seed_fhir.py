@@ -54,6 +54,18 @@ PATIENTS = [
 
 
 def iso(dt: datetime) -> str:
+    """Format a datetime as a UTC FHIR instant, e.g. "2026-11-01T17:00:00Z".
+
+    Args:
+        dt (datetime): a timezone-aware datetime.
+
+    Returns:
+        str: UTC timestamp ending in "Z".
+
+    Example:
+        >>> iso(datetime(2026, 11, 1, 12, 0, tzinfo=ZoneInfo("America/New_York")))
+        '2026-11-01T17:00:00Z'
+    """
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -61,12 +73,42 @@ HL7_DIR = Path(__file__).parent / "hl7_messages"
 
 
 def hl7_ts(dt: datetime) -> str:
-    """HL7 timestamp with timezone offset: YYYYMMDDHHMMSS+ZZZZ (always UTC here)."""
+    """Format a datetime as an HL7 timestamp with a UTC offset: YYYYMMDDHHMMSS+0000.
+
+    Args:
+        dt (datetime): a timezone-aware datetime.
+
+    Returns:
+        str: the HL7 timestamp.
+
+    Example:
+        >>> hl7_ts(datetime(2026, 11, 1, 12, 0, tzinfo=ZoneInfo("America/New_York")))
+        '20261101170000+0000'
+    """
     return dt.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S+0000")
 
 
 def write_hl7(mrn, first, last, dob, icd, icd_text, discharge: datetime) -> None:
-    """Write the ADT^A03 (discharge) message for this patient. Field meanings: see hl7_parser.py."""
+    """Write the ADT^A03 (discharge) message for one patient to hl7_messages/adt_a03_<MRN>.hl7.
+    Field meanings are explained at the top of hl7_parser.py.
+
+    Args:
+        mrn (str): medical record number.
+        first (str): given name.
+        last (str): family name.
+        dob (str): birth date, "YYYY-MM-DD".
+        icd (str): ICD-10-CM code for DG1-3.
+        icd_text (str): description of that code.
+        discharge (datetime): discharge time; written to MSH-7, EVN-2, PV1-45 and DG1-5.
+
+    Returns:
+        None. Writes a file with CRLF line endings.
+
+    Example:
+        >>> write_hl7("MRN1001", "Alice", "Morgan", "1950-03-14", "I50.9",
+        ...           "Heart failure, unspecified", datetime(2026, 10, 31, 23, 26, 38, tzinfo=UTC))
+        # file begins: MSH|^~&|DEMO_EHR|DEMO_GENERAL|DISCHARGE_AGENT|DEMO_GENERAL|20261031232638+0000||ADT^A03^ADT_A03|...
+    """
     ts = hl7_ts(discharge)
     pv1 = [""] * 46
     pv1[0], pv1[1], pv1[2], pv1[3], pv1[45] = "PV1", "1", "I", "3WEST^301^A", ts  # PV1-45 = discharge time
@@ -82,11 +124,25 @@ def write_hl7(mrn, first, last, dob, icd, icd_text, discharge: datetime) -> None
 
 
 def find_or_create(resource: dict, seed_id: str, keep: tuple = ()) -> dict:
-    """Search-before-create using our seed identifier, so reruns add nothing.
+    """Search-before-create, using our seed identifier, so re-runs add nothing.
 
-    If the resource already exists but differs from what we want (e.g. it predates the
-    RxNorm codes), update it in place. Fields named in `keep` (times that are relative to
-    "now") are left as they were on the first run."""
+    If the resource already exists but differs from what we want (for example it predates the
+    RxNorm codes), it is updated in place. Fields named in `keep` (times that are relative to
+    "now") are left as they were on the first run.
+
+    Args:
+        resource (dict): the resource we want; its identifier is set to the seed identifier.
+        seed_id (str): the identifier value, e.g. "MRN1001-ENC".
+        keep (tuple): field names that are never overwritten on an existing resource.
+
+    Returns:
+        dict: the stored resource (new, updated, or unchanged).
+
+    Example:
+        >>> find_or_create({"resourceType": "Encounter", "status": "finished"},
+        ...                "MRN1001-ENC", keep=("period",))["id"]
+        '1001'
+    """
     resource["identifier"] = [{"system": SEED_ID_SYSTEM, "value": seed_id}]
     found = fhir.search(resource["resourceType"], {"identifier": f"{SEED_ID_SYSTEM}|{seed_id}"})
     if not found:
@@ -100,6 +156,23 @@ def find_or_create(resource: dict, seed_id: str, keep: tuple = ()) -> dict:
 
 def seed_patient(mrn, first, last, dob, phone, street, hours_ago, has_appt, icd, icd_text, meds):
     # Patient: the person. identifier = MRN (medical record number), the key HL7 messages use.
+    """Create or update everything for one synthetic patient: Patient, Encounter, Condition,
+    MedicationRequests and (for two patients) an Appointment. Also writes the patient's HL7 file.
+
+    Args:
+        mrn, first, last, dob, phone, street: identifying details (all synthetic).
+        hours_ago (int): how long ago they were discharged, used on the first run only.
+        has_appt (bool): whether to create a seeded follow-up appointment.
+        icd, icd_text (str): discharge diagnosis code and description.
+        meds (list[tuple]): (text, instruction, rxnorm_code, rxnorm_display) per medication.
+
+    Returns:
+        str: the FHIR Patient ID.
+
+    Example:
+        >>> seed_patient(*PATIENTS[0])
+        '1000'
+    """
     patient = fhir.conditional_update(
         {
             "resourceType": "Patient",
@@ -190,6 +263,14 @@ def seed_patient(mrn, first, last, dob, phone, street, hours_ago, has_appt, icd,
 
 
 def main():
+    """Seed all five patients, then print a table: MRN, FHIR Patient ID, number of meds, whether an
+    Appointment exists (any Appointment, including ones the agent booked), diagnosis code.
+
+    Example:
+        $ python seed_fhir.py
+        MRN      Patient ID    Meds  Has appointment  Discharge dx (ICD-10-CM)
+        MRN1001  1000          3     no               I50.9
+    """
     rows = []
     for p in PATIENTS:
         pid = seed_patient(*p)

@@ -14,6 +14,22 @@ _client = None
 
 
 def get_client() -> anthropic.Anthropic:
+    """Return the one shared Anthropic client, creating it on first use.
+
+    Reads ANTHROPIC_BASE_URL (the Open WebUI gateway) and ANTHROPIC_API_KEY from the environment
+    (loaded from .env). The same client object is returned on every later call.
+
+    Returns:
+        anthropic.Anthropic: client with the gateway base URL and a 60-second timeout.
+
+    Raises:
+        RuntimeError: if either setting is missing or the key still starts with "your-".
+
+    Example:
+        >>> client = get_client()
+        >>> get_client() is client
+        True
+    """
     global _client
     if _client is None:
         base_url = os.getenv("ANTHROPIC_BASE_URL")

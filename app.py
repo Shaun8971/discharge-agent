@@ -31,7 +31,15 @@ LOCAL_TZ = ZoneInfo(HOSPITAL_TZ)
 
 
 def load_patients() -> list[dict]:
-    """Parse every HL7 file into one row per patient (local files only; no FHIR call)."""
+    """Parse every hl7_messages/*.hl7 file into one row per patient. Local files only; no FHIR call.
+
+    Returns:
+        list[dict]: {"file": Path, "parsed": dict | None, "error": str | None} per file.
+
+    Example:
+        >>> load_patients()[0]["parsed"]["mrn"]
+        'MRN1001'
+    """
     rows = []
     for f in sorted(HL7_DIR.glob("*.hl7")):
         try:
@@ -42,6 +50,14 @@ def load_patients() -> list[dict]:
 
 
 def status_of(mrn: str) -> str:
+    """Follow-up status of a patient in this browser session.
+
+    Args:
+        mrn (str): medical record number.
+
+    Returns:
+        str: "Not contacted", "In progress" or "Completed".
+    """
     p = st.session_state.patients.get(mrn)
     if p is None:
         return "Not contacted"
@@ -49,7 +65,13 @@ def status_of(mrn: str) -> str:
 
 
 def start_followup(mrn: str, parsed: dict):
-    """Look the patient up in FHIR, start the agent, and save the conversation under their MRN."""
+    """Look the patient up in FHIR, start the agent, and save the conversation under their MRN in
+    the session. Shows an error and saves nothing if the lookup or the agent fails.
+
+    Args:
+        mrn (str): medical record number.
+        parsed (dict): the parsed HL7 fields for that patient.
+    """
     try:
         patient_id, encounter_id = hl7_parser.find_patient(parsed["mrn"])
     except hl7_parser.HL7Error as e:
@@ -73,6 +95,10 @@ def start_followup(mrn: str, parsed: dict):
 
 
 def discharges_page():
+    """Page 1. A table of discharged patients (one row each, with a status and one button), then the
+    selected patient's chat, the End conversation button, and the Behind the scenes sidebar.
+    Each patient's chat is kept in st.session_state, so switching patients resumes where you left off.
+    """
     ss = st.session_state
     ss.setdefault("patients", {})   # mrn -> saved conversation
     ss.setdefault("selected", None)  # mrn currently open
@@ -185,11 +211,33 @@ def discharges_page():
 
 # ---------------------------------------------------------------- page 2: dashboard
 def pct(n, d):
+    """Format n / d as a whole-number percentage.
+
+    Args:
+        n (int): numerator.
+        d (int): denominator.
+
+    Returns:
+        str: e.g. "86%", or "n/a" if d is 0.
+
+    Example:
+        >>> pct(6, 7)
+        '86%'
+    """
     return f"{n / d:.0%}" if d else "n/a"
 
 
 def fhir_counts():
-    """Agent activity as recorded in FHIR (resources carrying the agent tag)."""
+    """Count the agent's activity in FHIR: resources tagged urn:demo:source|discharge-agent.
+
+    Returns:
+        dict | None: {"appointments", "tasks_routine", "tasks_urgent"}, or None if FHIR is
+            unreachable.
+
+    Example:
+        >>> fhir_counts()
+        {'appointments': 0, 'tasks_routine': 0, 'tasks_urgent': 0}
+    """
     try:
         return {
             "appointments": fhir.count("Appointment", {"_tag": AGENT_TAG}),
@@ -201,11 +249,27 @@ def fhir_counts():
 
 
 def stat_value(key):
+    """Format one HOSPITAL_STATS value for display.
+
+    Args:
+        key (str): a key of HOSPITAL_STATS, e.g. "annual_discharges".
+
+    Returns:
+        str: the value ("334" for numbers, with thousands separators), or "Not filled in yet" if it
+            is None, empty or "REPLACE_ME".
+
+    Example:
+        >>> stat_value("annual_discharges")
+        '334'
+    """
     v = HOSPITAL_STATS.get(key)
     return NOT_FILLED if v in (None, "", "REPLACE_ME") else f"{v:,}" if isinstance(v, (int, float)) else str(v)
 
 
 def dashboard_page():
+    """Page 2. KPI tiles (some from the log, some live from FHIR), the recent conversations table, and
+    the "Statistics from this hospital" section.
+    """
     st.title("Dashboard")
     st.button("Refresh")
     records = read_conversations()
@@ -232,7 +296,7 @@ def dashboard_page():
 
     st.subheader("Recent conversations")
     if not records:
-        st.info("No conversations logged yet. Process a discharge and click End conversation.")
+        st.info("No conversations logged yet. Start a follow-up on the Patient follow-up page, then click End conversation.")
     else:
         rows = [{
             "Time": datetime.fromisoformat(r["ended"]).astimezone().strftime("%Y-%m-%d %H:%M"),

@@ -20,7 +20,8 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 # Hospital local timezone: appointment times (09:00 / 14:00) are in this zone.
 HOSPITAL_TZ = "America/New_York"
 
-# Token prices in USD per million tokens. TODO: fill in from Anthropic's pricing page (Phase 4).
+# Token prices in USD per million tokens, for the model you use. Set by the project owner:
+# check them against your provider's price list, they drive the dashboard's cost tiles.
 PRICE_INPUT_PER_MTOK = 2
 PRICE_OUTPUT_PER_MTOK = 10
 # Prompt-cache pricing relative to the input price (Anthropic's standard multipliers; verify on the pricing page)

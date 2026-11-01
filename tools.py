@@ -18,10 +18,27 @@ SLOTS = {"morning": (9, 0), "afternoon": (14, 0)}
 
 
 class ToolError(Exception):
-    """A problem the model should be told about (bad input, rule violation)."""
+    """A problem the model should be told about: bad input or a broken rule (for example
+    "already has an appointment"). run_tool() turns it into an error tool_result.
+    """
 
 
 def _patient_ref(patient_id) -> dict:
+    """Check that patient_id is well formed and exists in FHIR; return a FHIR reference to it.
+
+    Args:
+        patient_id (str): FHIR Patient ID, letters, digits, "-" or "." (1 to 64 characters).
+
+    Returns:
+        dict: {"reference": "Patient/<id>"}, ready to put in a resource.
+
+    Raises:
+        ToolError: if the ID is malformed or no such patient exists.
+
+    Example:
+        >>> _patient_ref("1000")
+        {'reference': 'Patient/1000'}
+    """
     if not isinstance(patient_id, str) or not re.fullmatch(r"[A-Za-z0-9\-.]{1,64}", patient_id):
         raise ToolError("patient_id must be the patient ID from the discharge event.")
     try:
@@ -32,6 +49,18 @@ def _patient_ref(patient_id) -> dict:
 
 
 def _upcoming_booked(patient_id: str) -> list[dict]:
+    """List the patient's appointments that are booked and start in the future, soonest first.
+
+    Args:
+        patient_id (str): FHIR Patient ID.
+
+    Returns:
+        list[dict]: Appointment resources (any appointment, not only follow-ups).
+
+    Example:
+        >>> [a["start"] for a in _upcoming_booked("1006")]
+        ['2026-11-06T15:00:00Z']
+    """
     now = datetime.now(timezone.utc)
     appts = fhir.search("Appointment", {"actor": f"Patient/{patient_id}", "status": "booked"})
     return sorted(
@@ -41,9 +70,25 @@ def _upcoming_booked(patient_id: str) -> list[dict]:
 
 
 def get_patient_context(patient_id: str) -> dict:
-    """PHI minimization point: returns ONLY first name, discharge date, meds (name +
-    instruction) and upcoming appointments (date, time, status). No address, phone, birth date,
-    diagnosis or drug codes, and never a full FHIR resource."""
+    """Tool 1. Return the minimum the model needs to run the check-in (the PHI minimization point).
+
+    Returns ONLY first name, discharge date, medications (name and instruction text) and upcoming
+    appointments (date, local time, status). No address, phone, birth date, diagnosis or drug codes,
+    and never a full FHIR resource.
+
+    Args:
+        patient_id (str): FHIR Patient ID.
+
+    Returns:
+        dict: {"first_name", "discharge_date", "medications", "upcoming_appointments"}.
+
+    Raises:
+        ToolError: if patient_id is malformed or unknown.
+
+    Example:
+        >>> get_patient_context("1006")["upcoming_appointments"]
+        [{'date': '2026-11-06', 'time': '10:00', 'status': 'booked'}]
+    """
     _patient_ref(patient_id)
     patient = fhir.get("Patient", patient_id)
     given = (patient.get("name") or [{}])[0].get("given") or [""]
@@ -70,6 +115,27 @@ def get_patient_context(patient_id: str) -> dict:
 
 
 def book_followup(patient_id: str, date: str, time_of_day: str) -> dict:
+    """Tool 2. Book a 30-minute post-discharge follow-up Appointment in FHIR.
+
+    Rules: time_of_day is "morning" (09:00) or "afternoon" (14:00) in the hospital timezone; the
+    date is 1 to 14 days from today; the patient must have no other upcoming booked appointment.
+
+    Args:
+        patient_id (str): FHIR Patient ID.
+        date (str): ISO date, e.g. "2026-11-04".
+        time_of_day (str): "morning" or "afternoon".
+
+    Returns:
+        dict: {"appointment_id", "date", "time", "status": "booked"}.
+
+    Raises:
+        ToolError: for a bad time_of_day or date, a date outside the 1 to 14 day window, or an
+            existing upcoming appointment.
+
+    Example:
+        >>> book_followup("1024", "2026-11-04", "morning")
+        {'appointment_id': '1046', 'date': '2026-11-04', 'time': '09:00', 'status': 'booked'}
+    """
     ref = _patient_ref(patient_id)
     if time_of_day not in SLOTS:
         raise ToolError("time_of_day must be 'morning' or 'afternoon'.")
@@ -94,6 +160,23 @@ def book_followup(patient_id: str, date: str, time_of_day: str) -> dict:
 
 
 def escalate_to_nurse(patient_id: str, reason: str, urgency: str) -> dict:
+    """Tool 3. Create a FHIR Task asking a nurse to follow up with the patient.
+
+    Args:
+        patient_id (str): FHIR Patient ID.
+        reason (str): short factual reason, not empty, at most 300 characters.
+        urgency (str): "routine" or "urgent".
+
+    Returns:
+        dict: {"task_id", "urgency", "status": "requested"}.
+
+    Raises:
+        ToolError: for a bad urgency, an empty reason, or a reason longer than 300 characters.
+
+    Example:
+        >>> escalate_to_nurse("1024", "Patient asked about a rash", "routine")
+        {'task_id': '1047', 'urgency': 'routine', 'status': 'requested'}
+    """
     ref = _patient_ref(patient_id)
     if urgency not in ("routine", "urgent"):
         raise ToolError("urgency must be 'routine' or 'urgent'.")
@@ -110,8 +193,24 @@ def escalate_to_nurse(patient_id: str, reason: str, urgency: str) -> dict:
 
 
 def write_summary(patient_id: str, summary: str, encounter_id: str | None = None) -> str:
-    """Not a model tool: the agent code calls this once, at end of conversation, to store the
-    summary as a FHIR Communication (a record that a message/contact took place)."""
+    """Store the end-of-conversation summary as a FHIR Communication. Not a model tool: the agent
+    code calls it once, when the conversation ends.
+
+    Args:
+        patient_id (str): FHIR Patient ID.
+        summary (str): the 2 to 3 sentence summary (should contain no patient name).
+        encounter_id (str | None): FHIR Encounter ID to link, or None.
+
+    Returns:
+        str: the ID of the new Communication.
+
+    Raises:
+        fhir_client.FhirError: if FHIR rejects the resource.
+
+    Example:
+        >>> write_summary("1024", "Example summary.")
+        '1048'
+    """
     comm = {
         "resourceType": "Communication", "meta": AGENT_TAG, "status": "completed",
         "subject": {"reference": f"Patient/{patient_id}"},
@@ -161,10 +260,24 @@ _FUNCS = {"get_patient_context": get_patient_context, "book_followup": book_foll
 
 
 def run_tool(name: str, tool_input: dict, expected_patient_id: str) -> tuple[dict, dict]:
-    """Run one tool call. Returns (result, record). Never raises.
+    """Run one tool call requested by the model, safely. Never raises.
 
-    The model may only act on the patient this conversation is about: a different
-    patient_id is rejected, so a confused or manipulated model can't touch other records."""
+    Only the patient this conversation is about may be touched: any other patient_id is rejected,
+    so a confused or manipulated model cannot reach other records.
+
+    Args:
+        name (str): tool name, one of the three in TOOL_SPECS.
+        tool_input (dict): the input the model supplied.
+        expected_patient_id (str): the patient ID of this conversation.
+
+    Returns:
+        tuple[dict, dict]: (result, record). result is the tool output, or {"error": message}.
+            record is {"tool", "input", "ok", "error", "ms"} for the audit log.
+
+    Example:
+        >>> run_tool("get_patient_context", {"patient_id": "1006"}, "1000")
+        ({'error': "patient_id does not match this conversation's patient."}, {... 'ok': False ...})
+    """
     start = time.perf_counter()
     ok, error, result = True, None, {}
     try:

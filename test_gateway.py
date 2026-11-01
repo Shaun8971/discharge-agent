@@ -39,10 +39,21 @@ TOOLS = [{
 
 def show_usage(label, response):
     # Tokens are what the API bills for: input = what we sent, output = what the model wrote.
+    """Print the token counts of one response (input = what we sent, output = what the model wrote).
+
+    Args:
+        label (str): name of the test, e.g. "test 1".
+        response: an Anthropic message response.
+    """
     print(f"  usage ({label}): input_tokens={response.usage.input_tokens}, output_tokens={response.usage.output_tokens}")
 
 
 def fail(msg):
+    """Print "FAIL: <msg>" and exit the script with status 1.
+
+    Args:
+        msg (str): why the test failed.
+    """
     print(f"FAIL: {msg}")
     sys.exit(1)
 
